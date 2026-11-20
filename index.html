@@ -690,21 +690,31 @@ function lockButtons(on) { ['startBtn', 'hostBtn', 'joinBtn'].forEach(id => docu
 function ensureAudio() { if (!AC) try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { } else if (AC.state === 'suspended') AC.resume(); }
 function peerReady() { if (typeof Peer === 'undefined') { setLobby('온라인 연결 모듈을 불러오지 못했어요. 인터넷 연결을 확인하고 새로고침해 주세요.'); return false; } return true; }
 function resetNet(msg) {
+  clearTimeout(NET.reTimer); NET.reTimer = null;
   try { NET.peer && NET.peer.destroy(); } catch (e) { }
   Object.assign(NET, { mode: 'local', conn: null, peer: null }); lockButtons(false); setLobby(msg);
 }
-function hostRoom() {
+// 휴대폰에서 링크를 공유하러 다른 앱으로 가면 연결 서버와의 소켓이 끊겨요.
+// 방(코드)은 그대로 두고 같은 코드로 다시 연결해요.
+const RETRYABLE = ['network', 'server-error', 'socket-error', 'socket-closed', 'disconnected'];
+function lobbyStatus(text) { const el = document.getElementById('lobbyStatus'); if (el) el.textContent = text; else setLobby(text); }
+function hostRoom(code) {
   if (!peerReady()) return;
-  ensureAudio(); lockButtons(true); setLobby('방을 만드는 중…');
-  const code = Array.from({ length: 4 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('');
+  ensureAudio(); lockButtons(true);
+  const fresh = !code;
+  if (fresh) { code = Array.from({ length: 4 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join(''); NET.tries = 0; NET.code = code; setLobby('방을 만드는 중…'); }
   const peer = new Peer(PEER_PREFIX + code, PEER_OPTS); NET.peer = peer;
   peer.on('open', () => {
-    const link = location.origin + location.pathname + '?room=' + code;
-    setLobby(`방 코드 <b class="code">${code}</b><br>친구에게 아래 링크나 코드를 보내 주세요<br><span class="link">${link}</span><button class="mini" id="copyBtn">링크 복사</button><br><span class="wait">친구를 기다리는 중… 🏮</span>`);
-    document.getElementById('copyBtn').onclick = () => {
-      const b = document.getElementById('copyBtn');
-      (navigator.clipboard ? navigator.clipboard.writeText(link) : Promise.reject()).then(() => { b.textContent = '복사됐어요'; }, () => { b.textContent = '직접 복사해 주세요'; });
-    };
+    NET.tries = 0;
+    if (!document.getElementById('lobbyStatus')) {
+      const link = location.origin + location.pathname + '?room=' + code;
+      setLobby(`방 코드 <b class="code">${code}</b><br>친구에게 아래 링크나 코드를 보내 주세요<br><span class="link">${link}</span><button class="mini" id="copyBtn">링크 복사</button><br><span class="wait" id="lobbyStatus"></span>`);
+      document.getElementById('copyBtn').onclick = () => {
+        const btn = document.getElementById('copyBtn');
+        (navigator.clipboard ? navigator.clipboard.writeText(link) : Promise.reject()).then(() => { btn.textContent = '복사됐어요'; }, () => { btn.textContent = '직접 복사해 주세요'; });
+      };
+    }
+    lobbyStatus('친구를 기다리는 중… 🏮 (이 화면을 켜 둔 채로 기다려 주세요)');
   });
   peer.on('connection', conn => {
     if (NET.conn) { conn.on('open', () => { conn.send({ t: 'full' }); setTimeout(() => conn.close(), 500); }); return; }
@@ -712,25 +722,59 @@ function hostRoom() {
     conn.on('open', () => { conn.send({ t: 'hello' }); beginPlay(); });
     wireConn(conn);
   });
+  peer.on('disconnected', () => { if (state === 'title' && NET.peer === peer) retryHost(); });
   peer.on('error', err => {
-    if (err.type === 'unavailable-id') { peer.destroy(); NET.peer = null; hostRoom(); return; }
-    if (state === 'title') resetNet(`방을 만들지 못했어요 (${err.type}). 잠시 후 다시 시도해 주세요.`);
+    if (NET.peer !== peer || state !== 'title') return;
+    if (err.type === 'unavailable-id') {
+      // 새 방이면 다른 코드로, 다시 연결 중이면 서버가 옛 연결을 정리할 때까지 잠시 뒤 재시도
+      if (fresh && !document.getElementById('lobbyStatus')) { peer.destroy(); NET.peer = null; hostRoom(); } else retryHost();
+      return;
+    }
+    if (RETRYABLE.includes(err.type)) { retryHost(); return; }
+    resetNet(`방을 만들지 못했어요 (${err.type}). 잠시 후 다시 시도해 주세요.`);
   });
 }
-function joinRoom(raw) {
+function retryHost() {
+  if (NET.reTimer || state !== 'title') return;
+  NET.tries = (NET.tries || 0) + 1;
+  if (NET.tries > 10) { resetNet('연결 서버에 닿지 않아요. 인터넷 연결(와이파이 등)을 확인하고 다시 시도해 주세요.'); return; }
+  lobbyStatus(`연결 서버에 다시 연결하는 중… (${NET.tries})`);
+  NET.reTimer = setTimeout(() => {
+    NET.reTimer = null; const p = NET.peer;
+    if (state !== 'title' || !p) return;
+    if (!p.destroyed && p.disconnected) { try { p.reconnect(); return; } catch (e) { } }
+    if (!p.destroyed && p.open) { lobbyStatus('친구를 기다리는 중… 🏮 (이 화면을 켜 둔 채로 기다려 주세요)'); return; }
+    try { p.destroy(); } catch (e) { }
+    hostRoom(NET.code);
+  }, Math.min(800 * NET.tries, 4000));
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || state !== 'title' || !NET.peer) return;
+  if (NET.mode !== 'guest' && (NET.peer.disconnected || NET.peer.destroyed)) { clearTimeout(NET.reTimer); NET.reTimer = null; NET.tries = 0; retryHost(); }
+});
+function joinRoom(raw, attempt = 0) {
   const code = (raw || '').trim().toUpperCase();
   if (!/^[A-Z0-9]{4}$/.test(code)) { setLobby('4글자 방 코드를 입력해 주세요.'); return; }
   if (!peerReady()) return;
-  ensureAudio(); lockButtons(true); setLobby('친구 방에 연결하는 중…');
+  ensureAudio(); lockButtons(true); setLobby(attempt ? `친구 방을 찾는 중… (${attempt + 1})` : '친구 방에 연결하는 중…');
   const peer = new Peer(PEER_OPTS); NET.peer = peer;
+  const again = msg => {
+    if (NET.peer !== peer || state !== 'title') return;
+    try { peer.destroy(); } catch (e) { }
+    Object.assign(NET, { mode: 'local', conn: null, peer: null });
+    if (attempt < 5) setTimeout(() => joinRoom(code, attempt + 1), 1500 + attempt * 1000);
+    else resetNet(msg);
+  };
   peer.on('open', () => {
     const conn = peer.connect(PEER_PREFIX + code, { reliable: true }); NET.conn = conn; NET.mode = 'guest';
     wireConn(conn);
-    setTimeout(() => { if (state === 'title' && NET.mode === 'guest') resetNet('연결이 되지 않았어요. 방 코드를 확인하고 다시 시도해 주세요.'); }, 15000);
+    setTimeout(() => { if (state === 'title' && NET.peer === peer) again('연결이 되지 않았어요. 방 코드를 확인하고 다시 시도해 주세요.'); }, 12000);
   });
   peer.on('error', err => {
-    if (state !== 'title') return;
-    resetNet(err.type === 'peer-unavailable' ? '그 방을 찾을 수 없어요. 코드를 확인해 주세요.' : `연결하지 못했어요 (${err.type}). 잠시 후 다시 시도해 주세요.`);
+    if (NET.peer !== peer || state !== 'title') return;
+    if (err.type === 'peer-unavailable') again('그 방을 찾을 수 없어요. 방을 만든 친구가 대기 화면을 켜 두었는지 확인해 주세요.');
+    else if (RETRYABLE.includes(err.type)) again('연결 서버에 닿지 않아요. 인터넷 연결을 확인하고 다시 시도해 주세요.');
+    else resetNet(`연결하지 못했어요 (${err.type}). 잠시 후 다시 시도해 주세요.`);
   });
 }
 function wireConn(conn) {
@@ -746,11 +790,14 @@ function wireConn(conn) {
   const lost = () => {
     NET.remoteIn = [0, 0];
     if (state === 'play' && !NET.lostShown) { NET.lostShown = true; document.getElementById('lostOverlay').classList.remove('hidden'); }
-    else if (state === 'title') resetNet('연결이 끊겼어요. 다시 시도해 주세요.');
+    else if (state === 'title' && NET.conn === conn) {
+      if (NET.mode === 'host') { NET.conn = null; NET.mode = 'local'; lobbyStatus('친구를 기다리는 중… 🏮 (이 화면을 켜 둔 채로 기다려 주세요)'); }
+      else resetNet('연결이 끊겼어요. 다시 시도해 주세요.');
+    }
   };
   conn.on('close', lost); conn.on('error', lost);
 }
-document.getElementById('hostBtn').onclick = hostRoom;
+document.getElementById('hostBtn').onclick = () => hostRoom();
 document.getElementById('joinBtn').onclick = () => joinRoom(document.getElementById('codeIn').value);
 if (qs.get('room')) { document.getElementById('codeIn').value = qs.get('room').toUpperCase().slice(0, 4); setLobby('친구가 보낸 방이에요. <b>방 참가하기</b>를 눌러 주세요 🏮'); }
 // 터치 조작
